@@ -537,7 +537,7 @@ async function executeStep3(state) {
 function getMailConfig(state) {
   const provider = state.mailProvider || 'qq';
   if (provider === '163') {
-    return { source: 'mail-163', url: 'https://mail.163.com/', label: '163 Mail' };
+    return { source: 'mail-163', url: 'https://mail.163.com/js6/main.jsp?df=mail163_letter#module=mbox.ListModule%7C%7B%22fid%22%3A1%2C%22order%22%3A%22date%22%2C%22desc%22%3Atrue%7D', label: '163 Mail' };
   }
   return { source: 'qq-mail', url: 'https://wx.mail.qq.com/', label: 'QQ Mail' };
 }

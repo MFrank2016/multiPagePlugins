@@ -75,9 +75,16 @@ async function handlePollEmail(step, payload) {
 
   log(`Step ${step}: Starting email poll on 163 Mail (max ${maxAttempts} attempts)`);
 
-  // Wait for mail list to load
-  await sleep(3000);
+  // First, click on "收件箱" in left sidebar to ensure we're in inbox view
+  await sleep(2000);
+  const inboxLink = document.querySelector('.nui-tree-item-text[title="收件箱"]');
+  if (inboxLink) {
+    inboxLink.click();
+    log(`Step ${step}: Clicked inbox in sidebar`);
+    await sleep(2000);
+  }
 
+  // Wait for mail list to load
   let items = findMailItems();
   if (items.length === 0) {
     log(`Step ${step}: Waiting for mail list to appear...`);
@@ -156,28 +163,28 @@ async function handlePollEmail(step, payload) {
 // ============================================================
 
 async function refreshInbox() {
-  // 163 mail: click the "收信" button in toolbar
-  function tryRefresh(doc) {
-    const btn = doc.querySelector(
-      'a[title="收信"], [id*="refresh"], .nui-toolbar-item[title*="收"]'
-    );
-    if (btn) {
-      btn.click();
-      console.log(MAIL163_PREFIX, 'Clicked 收信 button');
-      return true;
+  // 163 mail: try the toolbar "刷 新" button first
+  // Actual DOM: <div class="js-component-button nui-btn"><span class="nui-btn-text">刷 新</span></div>
+  const toolbarBtns = document.querySelectorAll('.nui-btn .nui-btn-text');
+  for (const btn of toolbarBtns) {
+    if (btn.textContent.replace(/\s/g, '') === '刷新') {
+      btn.closest('.nui-btn').click();
+      console.log(MAIL163_PREFIX, 'Clicked toolbar "刷新" button');
+      await sleep(800);
+      return;
     }
-    return false;
   }
 
-  if (tryRefresh(document)) { await sleep(500); return; }
-
-  // Try in iframes
-  const iframes = document.querySelectorAll('iframe');
-  for (const iframe of iframes) {
-    try {
-      const doc = iframe.contentDocument || iframe.contentWindow?.document;
-      if (doc && tryRefresh(doc)) { await sleep(500); return; }
-    } catch { }
+  // Fallback: click the left sidebar "收 信" button
+  // Actual DOM: <li class="ra0 nb0"><span class="oz0">收 信</span></li>
+  const shouXinBtns = document.querySelectorAll('.ra0');
+  for (const btn of shouXinBtns) {
+    if (btn.textContent.replace(/\s/g, '').includes('收信')) {
+      btn.click();
+      console.log(MAIL163_PREFIX, 'Clicked sidebar "收信" button');
+      await sleep(800);
+      return;
+    }
   }
 
   console.log(MAIL163_PREFIX, 'Could not find refresh button');
