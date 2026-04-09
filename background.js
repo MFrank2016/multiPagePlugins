@@ -23,13 +23,12 @@ async function ensureAutomationWindowId() {
   }
   const registry = await getTabRegistry();
   for (const entry of Object.values(registry)) {
-    if (entry.tabId) {
-      try {
-        const tab = await chrome.tabs.get(entry.tabId);
-        automationWindowId = tab.windowId;
-        return automationWindowId;
-      } catch {}
-    }
+    if (!entry?.tabId) continue;
+    try {
+      const tab = await chrome.tabs.get(entry.tabId);
+      automationWindowId = tab.windowId;
+      return automationWindowId;
+    } catch {}
   }
   const win = await chrome.windows.getLastFocused();
   automationWindowId = win.id;
@@ -183,7 +182,7 @@ async function isTabAlive(source) {
     return true;
   } catch {
     // Tab no longer exists — clean up registry
-    registry[source] = null;
+    delete registry[source];
     await setState({ tabRegistry: registry });
     return false;
   }
@@ -375,6 +374,7 @@ async function reuseOrCreateTab(source, url, options = {}) {
 // ============================================================
 
 async function sendToContentScript(source, message) {
+  throwIfStopped();
   const registry = await getTabRegistry();
   const entry = registry[source];
 
@@ -522,6 +522,7 @@ async function broadcastStopToContentScripts() {
 }
 
 let stopRequested = false;
+let suppressContentMessages = false;
 
 // ============================================================
 // Message Handler (central router)
@@ -553,12 +554,18 @@ async function handleMessage(message, sender) {
     }
 
     case 'LOG': {
+      if (suppressContentMessages) {
+        return { ok: true };
+      }
       const { message: msg, level } = message.payload;
       await addLog(`[${message.source}] ${msg}`, level);
       return { ok: true };
     }
 
     case 'STEP_COMPLETE': {
+      if (suppressContentMessages) {
+        return { ok: true };
+      }
       if (stopRequested) {
         await setStepStatus(message.step, 'stopped');
         notifyStepError(message.step, STOP_ERROR_MESSAGE);
@@ -572,6 +579,9 @@ async function handleMessage(message, sender) {
     }
 
     case 'STEP_ERROR': {
+      if (suppressContentMessages) {
+        return { ok: true };
+      }
       if (isStopError(message.error)) {
         await setStepStatus(message.step, 'stopped');
         await addLog(`Step ${message.step} stopped by user`, 'warn');
@@ -589,13 +599,15 @@ async function handleMessage(message, sender) {
     }
 
     case 'RESET': {
-      clearStopRequest();
+      suppressContentMessages = true;
+      await requestStop();
       await resetState();
       await addLog('Flow reset', 'info');
       return { ok: true };
     }
 
     case 'EXECUTE_STEP': {
+      suppressContentMessages = false;
       clearStopRequest();
       const step = message.payload.step;
       // Save email if provided (from side panel step 3)
@@ -607,6 +619,7 @@ async function handleMessage(message, sender) {
     }
 
     case 'AUTO_RUN': {
+      suppressContentMessages = false;
       clearStopRequest();
       const totalRuns = message.payload?.totalRuns || 1;
       autoRunLoop(totalRuns);  // fire-and-forget
@@ -614,6 +627,7 @@ async function handleMessage(message, sender) {
     }
 
     case 'RESUME_AUTO_RUN': {
+      suppressContentMessages = false;
       clearStopRequest();
       if (message.payload.email) {
         await setEmailState(message.payload.email);
@@ -640,6 +654,7 @@ async function handleMessage(message, sender) {
     }
 
     case 'FETCH_DUCK_EMAIL': {
+      suppressContentMessages = false;
       clearStopRequest();
       const email = await fetchDuckEmail(message.payload || {});
       return { ok: true, email };
@@ -838,6 +853,7 @@ async function fetchDuckEmail(options = {}) {
   if (!result?.email) {
     throw new Error('Duck email not returned.');
   }
+  throwIfStopped();
 
   await setEmailState(result.email);
   await addLog(`Duck Mail: ${result.generated ? 'Generated' : 'Loaded'} ${result.email}`, 'ok');
@@ -863,6 +879,8 @@ async function autoRunLoop(totalRuns) {
   autoRunActive = true;
   autoRunTotalRuns = totalRuns;
   await setState({ autoRunning: true });
+  let successfulRuns = 0;
+  let endedEarly = false;
 
   for (let run = 1; run <= totalRuns; run++) {
     autoRunCurrentRun = run;
@@ -911,6 +929,7 @@ async function autoRunLoop(totalRuns) {
         const resumedState = await getState();
         if (!resumedState.email) {
           await addLog('Cannot resume: no email address.', 'error');
+          endedEarly = true;
           break;
         }
       }
@@ -932,8 +951,10 @@ async function autoRunLoop(totalRuns) {
       await executeStepAndWait(9, 1000);
 
       await addLog(`=== Run ${run}/${totalRuns} COMPLETE! ===`, 'ok');
+      successfulRuns += 1;
 
     } catch (err) {
+      endedEarly = true;
       if (isStopError(err)) {
         await addLog(`Run ${run}/${totalRuns} stopped by user`, 'warn');
       } else {
@@ -944,16 +965,16 @@ async function autoRunLoop(totalRuns) {
     }
   }
 
-  const completedRuns = autoRunCurrentRun;
+  const attemptedRuns = autoRunCurrentRun;
   if (stopRequested) {
-    await addLog(`=== Stopped after ${Math.max(0, completedRuns - 1)}/${autoRunTotalRuns} runs ===`, 'warn');
-    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'stopped', currentRun: completedRuns, totalRuns: autoRunTotalRuns } }).catch(() => {});
-  } else if (completedRuns >= autoRunTotalRuns) {
-    await addLog(`=== All ${autoRunTotalRuns} runs completed successfully ===`, 'ok');
-    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'complete', currentRun: completedRuns, totalRuns: autoRunTotalRuns } }).catch(() => {});
+    await addLog(`=== Stopped after ${successfulRuns}/${autoRunTotalRuns} runs ===`, 'warn');
+    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'stopped', currentRun: attemptedRuns, totalRuns: autoRunTotalRuns } }).catch(() => {});
+  } else if (endedEarly) {
+    await addLog(`=== Stopped after ${successfulRuns}/${autoRunTotalRuns} runs ===`, 'warn');
+    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'stopped', currentRun: attemptedRuns, totalRuns: autoRunTotalRuns } }).catch(() => {});
   } else {
-    await addLog(`=== Stopped after ${completedRuns}/${autoRunTotalRuns} runs ===`, 'warn');
-    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'stopped', currentRun: completedRuns, totalRuns: autoRunTotalRuns } }).catch(() => {});
+    await addLog(`=== All ${autoRunTotalRuns} runs completed successfully ===`, 'ok');
+    chrome.runtime.sendMessage({ type: 'AUTO_RUN_STATUS', payload: { phase: 'complete', currentRun: attemptedRuns, totalRuns: autoRunTotalRuns } }).catch(() => {});
   }
   autoRunActive = false;
   await setState({ autoRunning: false });
@@ -1114,6 +1135,7 @@ async function clickResendOnSignupPage(step) {
 async function executeStep4(state) {
   // Click "重新发送电子邮件" on the signup page before polling
   await clickResendOnSignupPage(4);
+  throwIfStopped();
 
   const mail = getMailConfig(state);
   if (mail.error) throw new Error(mail.error);
@@ -1157,6 +1179,7 @@ async function executeStep4(state) {
   }
 
   if (result && result.code) {
+    throwIfStopped();
     await setState({ lastEmailTimestamp: result.emailTimestamp });
     await addLog(`Step 4: Got verification code: ${result.code}`);
 
@@ -1226,6 +1249,7 @@ async function executeStep6(state) {
 async function executeStep7(state) {
   // Click "重新发送电子邮件" on the auth page before polling
   await clickResendOnSignupPage(7);
+  throwIfStopped();
 
   const mail = getMailConfig(state);
   if (mail.error) throw new Error(mail.error);
@@ -1268,6 +1292,7 @@ async function executeStep7(state) {
   }
 
   if (result && result.code) {
+    throwIfStopped();
     await addLog(`Step 7: Got login verification code: ${result.code}`);
 
     // Switch to signup/auth tab and fill code
@@ -1367,9 +1392,11 @@ async function executeStep8(state) {
         let signupTabId = await getTabId('signup-page');
         if (signupTabId) {
           await chrome.tabs.update(signupTabId, { active: true });
+          throwIfStopped();
           await addLog('Step 8: Switched to auth page. Preparing debugger click...');
         } else {
           signupTabId = await reuseOrCreateTab('signup-page', state.oauthUrl);
+          throwIfStopped();
           await addLog('Step 8: Auth tab reopened. Preparing debugger click...');
         }
 
@@ -1382,6 +1409,7 @@ async function executeStep8(state) {
         if (clickResult?.error) {
           throw new Error(clickResult.error);
         }
+        throwIfStopped();
 
         if (!resolved) {
           await clickWithDebugger(signupTabId, clickResult?.rect);
@@ -1451,6 +1479,7 @@ async function executeStep9(state) {
   await new Promise(r => setTimeout(r, 1000));
 
   // Send command directly — bypass queue/ready mechanism
+  throwIfStopped();
   await addLog(`Step 9: Filling callback URL...`);
   await chrome.tabs.sendMessage(tabId, {
     type: 'EXECUTE_STEP',
